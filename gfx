@@ -1,0 +1,283 @@
+#!/bin/bash
+# GFX 照片管理器命令行工具
+# 用法: ./gfx <命令>
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LABEL="com.gfx.photo-manager"
+PLIST_SRC="$PROJECT_DIR/scripts/$LABEL.plist"
+PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG_OUT="/tmp/gfx-photo-manager.log"
+LOG_ERR="/tmp/gfx-photo-manager.err.log"
+PORT="${PORT:-5173}"
+
+# ── 定位 node：优先用 PATH，回落到 WorkBuddy 托管版本 ──────────────
+find_node() {
+  if command -v node >/dev/null 2>&1; then
+    command -v node
+    return
+  fi
+  for c in "$HOME/.workbuddy/binaries/node/versions/current/bin/node" \
+           /usr/local/bin/node \
+           /opt/homebrew/bin/node; do
+    [ -x "$c" ] && { echo "$c"; return; }
+  done
+  for c in "$HOME"/.workbuddy/binaries/node/versions/*/bin/node; do
+    [ -x "$c" ] && { echo "$c"; return; }
+  done
+  echo ""
+}
+
+NODE="$(find_node)"
+if [ -z "$NODE" ]; then
+  echo "❌ 找不到 node。请安装 Node.js 18+，或把它加进 PATH。" >&2
+  exit 1
+fi
+
+run() { "$NODE" "$PROJECT_DIR/scripts/$1.mjs" "${@:2}"; }
+
+# ── 服务存活判据：以「端口上有进程」为准 ────────────────────────────
+# launchctl 在部分受限环境（沙箱/远程会话）会返回 EIO，
+# 因此状态判断统一以端口监听为准，launchctl 只是可选的开机自启手段。
+# 注意：lsof 查不到时会返回 1，配合 set -o pipefail 会让整个管道失败，
+# 再加 set -e 就会静默终止脚本，因此这里必须 || true。
+port_pid() { lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1 || true; }
+is_running() { [ -n "$(port_pid)" ]; }
+
+launchctl_alive() { launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; }
+
+# 通过 launchctl 启动；若不可用或服务未真正起来，回落到直启后台进程。
+# 注意：launchctl load 失败时退出码仍可能为 0，因此必须验证端口后才算成功。
+start_service() {
+  if [ -f "$PLIST_DST" ] || [ -f "$PLIST_SRC" ]; then
+    mkdir -p "$HOME/Library/LaunchAgents"
+    [ -f "$PLIST_DST" ] || cp "$PLIST_SRC" "$PLIST_DST"
+    launchctl load "$PLIST_DST" >/dev/null 2>&1 || true
+    if wait_up 20; then
+      echo "launchd" > /tmp/.gfx-mode
+      return 0
+    fi
+  fi
+  echo "direct" > /tmp/.gfx-mode
+  nohup "$NODE" "$PROJECT_DIR/scripts/serve.mjs" \
+    >> "$LOG_OUT" 2>> "$LOG_ERR" &
+  disown 2>/dev/null || true
+  wait_up 40 || true
+}
+
+# 等待端口就绪，最多 n × 0.25 秒
+wait_up() {
+  local n="${1:-40}" i=0
+  while [ $i -lt "$n" ]; do
+    is_running && return 0
+    sleep 0.25
+    i=$((i + 1))
+  done
+  return 1
+}
+
+stop_service() {
+  launchctl unload "$PLIST_DST" >/dev/null 2>&1 || true
+  local p i=0
+  p="$(port_pid)"
+  # 注意用 if 而非 && 短路：脚本开了 set -e，短路求值返回 1 会静默终止脚本
+  if [ -n "$p" ]; then
+    kill "$p" 2>/dev/null || true
+  fi
+  while is_running && [ $i -lt 20 ]; do sleep 0.25; i=$((i + 1)); done
+  if is_running; then
+    p="$(port_pid)"
+    if [ -n "$p" ]; then
+      kill -9 "$p" 2>/dev/null || true
+    fi
+    sleep 0.5
+  fi
+  rm -f /tmp/.gfx-mode /tmp/.gfx-watch
+}
+
+case "${1:-}" in
+  scan)
+    run scan "${@:2}"
+    ;;
+  rescan)
+    run scan --force "${@:2}"
+    ;;
+  probe)
+    if [ -z "${2:-}" ]; then
+      echo "用法: ./gfx probe <照片文件路径>" >&2
+      echo "例:   ./gfx probe ~/Pictures/GFX/2026-09-福冈/DSCF1000.RAF" >&2
+      exit 1
+    fi
+    run probe "$2"
+    ;;
+  start)
+    if is_running; then
+      echo "服务已在运行 → http://127.0.0.1:$PORT"
+    else
+      start_service
+      if is_running; then
+        echo "✅ 服务已启动 → http://127.0.0.1:$PORT"
+      else
+        echo "❌ 启动失败，查看错误日志:" >&2
+        tail -20 "$LOG_ERR" 2>/dev/null >&2
+        exit 1
+      fi
+    fi
+    ;;
+  stop)
+    if is_running; then
+      stop_service
+      echo "✅ 服务已停止"
+    else
+      echo "服务未在运行"
+    fi
+    ;;
+  restart)
+    stop_service
+    sleep 0.5
+    start_service
+    if is_running; then
+      echo "✅ 服务已重启 → http://127.0.0.1:$PORT"
+    else
+      echo "❌ 重启失败，查看错误日志:" >&2
+      tail -20 "$LOG_ERR" 2>/dev/null >&2
+      exit 1
+    fi
+    ;;
+  watch)
+    # 监听模式：目录变动自动增量扫描。与 launchd 常驻（开机自启）互斥，
+    # 因此统一用直驻后台方式启动，方便随时停止。
+    if is_running; then
+      echo "⚠  服务已在运行，正在重启为监听模式…"
+      stop_service
+      sleep 0.5
+    fi
+    echo "direct" > /tmp/.gfx-mode
+    echo "watch" > /tmp/.gfx-watch
+    WATCH=1 nohup "$NODE" "$PROJECT_DIR/scripts/serve.mjs" \
+      >> "$LOG_OUT" 2>> "$LOG_ERR" &
+    disown 2>/dev/null || true
+    if wait_up 40; then
+      echo "✅ 监听模式已启动 → http://127.0.0.1:$PORT"
+      echo "   照片目录一有变动，3 秒后自动增量扫描，页面会自动刷新。"
+      echo "   停止: ./gfx stop"
+    else
+      echo "❌ 启动失败，查看错误日志:" >&2
+      tail -20 "$LOG_ERR" 2>/dev/null >&2
+      exit 1
+    fi
+    ;;
+  status)
+    if is_running; then
+      PID="$(port_pid)"
+      MODE="$(cat /tmp/.gfx-mode 2>/dev/null || echo direct)"
+      case "$MODE" in
+        launchd) MODE_TXT="launchd 常驻（开机自启）" ;;
+        *) MODE_TXT="直驻后台（本会话有效）" ;;
+      esac
+      echo "● 运行中  PID=$PID   http://127.0.0.1:$PORT"
+      echo "  运行模式: $MODE_TXT"
+      if [ -f /tmp/.gfx-watch ]; then
+        echo "  监听模式: 已开启（目录变动自动扫描）"
+      fi
+      if curl -s --noproxy '*' -m 3 -o /dev/null "http://127.0.0.1:$PORT/api/health"; then
+        echo "  健康检查: 正常"
+        curl -s --noproxy '*' -m 5 "http://127.0.0.1:$PORT/api/index" | "$NODE" -e "
+let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{
+try{const j=JSON.parse(s);
+console.log('  照片总数:', j.total);
+console.log('  用户标签:', (j.tags||[]).length, '个');
+}catch{console.log('  索引解析失败')}})"
+      else
+        echo "  健康检查: 无响应"
+      fi
+    else
+      echo "○ 已停止（运行 ./gfx start 启动）"
+    fi
+    ;;
+  open)
+    open "http://127.0.0.1:$PORT" 2>/dev/null || echo "请手动打开 http://127.0.0.1:$PORT"
+    ;;
+  log)
+    echo "── 标准输出 (Ctrl+C 退出) ──"
+    tail -f "$LOG_OUT" 2>/dev/null || echo "暂无日志"
+    ;;
+  errlog)
+    echo "── 错误日志 (Ctrl+C 退出) ──"
+    tail -f "$LOG_ERR" 2>/dev/null || echo "暂无错误日志"
+    ;;
+  install)
+    mkdir -p "$HOME/Library/LaunchAgents"
+    cp "$PLIST_SRC" "$PLIST_DST"
+    if ! launchctl_alive; then
+      if launchctl load "$PLIST_DST" >/dev/null 2>&1; then
+        echo "launchd" > /tmp/.gfx-mode
+        sleep 2
+        if is_running; then
+          echo "✅ 已设为开机自启，服务运行中 → http://127.0.0.1:$PORT"
+          exit 0
+        fi
+      fi
+      echo "⚠  launchd 在当前环境不可用，改用直驻后台模式启动"
+      echo "   （开机自启仍已配置，下次登录会自动生效）"
+      start_service
+      sleep 1
+      if is_running; then
+        echo "✅ 服务已启动 → http://127.0.0.1:$PORT"
+      else
+        echo "❌ 启动失败，查看错误日志:" >&2
+        tail -20 "$LOG_ERR" 2>/dev/null >&2
+        exit 1
+      fi
+      exit 0
+    fi
+    echo "✅ 已设为开机自启，服务运行中 → http://127.0.0.1:$PORT"
+    ;;
+  uninstall)
+    stop_service
+    rm -f "$PLIST_DST"
+    echo "✅ 已取消开机自启，服务已停止"
+    ;;
+  smoke)
+    run smoke
+    ;;
+  help|"")
+    cat <<EOF
+GFX 照片管理器
+
+用法: ./gfx <命令>
+
+日常使用
+  scan          扫描照片目录（增量，只处理新增和改动的）
+  rescan        强制全量重建索引和缩略图
+  open          在浏览器打开管理页面
+  status        查看服务状态和照片数量
+
+服务管理
+  start         启动服务（后台常驻）
+  stop          停止服务
+  restart       重启服务
+  watch         启动监听模式（照片目录变动自动扫描）
+  install       设为开机自启并立即启动（只需执行一次）
+  uninstall     取消开机自启
+
+排查与维护
+  probe <文件>  探测单张照片的 EXIF，用于校准胶片模拟
+  log           实时查看服务日志
+  errlog        实时查看错误日志
+  smoke         跑前端冒烟测试（需服务已启动）
+
+示例
+  ./gfx install          # 首次使用，设为开机自启
+  ./gfx scan             # 导入新照片后执行
+  ./gfx open             # 打开页面查看
+
+当前 node: $NODE
+EOF
+    ;;
+  *)
+    echo "❌ 未知命令: $1" >&2
+    echo "运行 ./gfx help 查看可用命令" >&2
+    exit 1
+    ;;
+esac
