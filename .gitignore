@@ -1,0 +1,6 @@
+node_modules/
+data/
+public/thumbs/
+mock-library/
+*.log
+.DS_Store
